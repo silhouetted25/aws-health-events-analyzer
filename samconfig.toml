@@ -1,0 +1,15 @@
+version = 0.1
+[default]
+[default.deploy]
+[default.deploy.parameters]
+stack_name = "health-events-analyzer-v2"
+s3_bucket = "aws-sam-cli-managed-default-samclisourcebucket-EXAMPLE"
+s3_prefix = "health-events-analyzer-v2"
+region = "ap-southeast-1"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM"
+resolve_s3 = true
+parameter_overrides = "AnalysisWindowDays=\"8\" SenderEmail=\"kharizwf@amazon.com\" RecipientEmails=\"kharizwf@amazon.com\" EventCategories=\"accountNotification\" ExcludedServices=\"\" ExcelFilenameTemplate=\"AWS_Health_Events_Analysis_{date}_{time}.xlsx\" ScheduleEnabled=\"true\" CustomerName=\"\" BedrockTopP=\"0.9\" S3BucketName=\"aha-phd-tool\" S3KeyPrefix=\"health-events\""
+image_repositories = []
+disable_rollback = true
+

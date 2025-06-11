@@ -1,0 +1,279 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: 'AWS Health Events Analysis Solution with Lambda and EventBridge trigger - Analyzes AWS Health events using Amazon Bedrock'
+
+Parameters:
+  AnalysisWindowDays:
+    Type: Number
+    Default: 8
+    Description: Number of days of historical events to analyze
+    MinValue: 1
+    MaxValue: 365
+  
+  SenderEmail:
+    Type: String
+    Description: Email address to send reports from (must be verified in SES)
+    
+  RecipientEmails:
+    Type: String
+    Description: Comma-separated list of email addresses to receive reports
+    
+  EventCategories:
+    Type: String
+    Description: Optional comma-separated list of event categories to filter
+    Default: 'accountNotification'
+    
+  ExcludedServices:
+    Type: String
+    Description: Optional comma-separated list of services to exclude from analysis
+    Default: ''
+    
+  ExcelFilenameTemplate:
+    Type: String
+    Description: Template for Excel filenames (use {date} and {time} as placeholders)
+    Default: 'AWS_Health_Events_Analysis_{date}_{time}.xlsx'
+    
+  ScheduleEnabled:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'true'
+    Description: Enable or disable the scheduled execution
+    
+  CustomerName:
+    Type: String
+    Description: Customer name for report customization (optional)
+    Default: ''
+    
+  BedrockTopP:
+    Type: Number
+    Default: 0.9
+    Description: Top-p parameter for Bedrock model (0.0-1.0)
+    MinValue: 0.0
+    MaxValue: 1.0
+    
+  # S3 bucket name parameter with empty default
+  S3BucketName:
+    Type: String
+    Description: Name of the S3 bucket to store health events analysis
+    Default: ''
+    
+  # S3 key prefix parameter with empty default
+  S3KeyPrefix:
+    Type: String
+    Description: Prefix for S3 objects in the bucket
+    Default: ''
+
+Resources:
+  # Layer for Python dependencies
+  DependenciesLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: health-events-analyzer-dependencies
+      Description: Dependencies for Health Events Analyzer
+      ContentUri: ./layer
+      CompatibleRuntimes:
+        - python3.9
+      RetentionPolicy: Retain
+    Metadata:
+      BuildMethod: python3.9
+      BuildArchitecture: x86_64
+      RequirementsPath: requirements.txt
+
+  # IAM Role for Lambda execution with all required permissions
+  HealthEventsAnalyzerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: HealthEventsAnalyzerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Core permissions from your existing role
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - bedrock:InvokeModel
+                  - bedrock-runtime:InvokeModel
+                  - ses:SendEmail
+                  - ses:SendRawEmail
+                  - cloudwatch:PutMetricData
+                  - health:DescribeEvents
+                  - health:DescribeEventDetails
+                  - health:DescribeAffectedEntities
+                  - health:DescribeEventDetailsForOrganization
+                  - health:DescribeAffectedAccountsForOrganization
+                  - health:DescribeEventsForOrganization
+                  - health:DescribeAffectedEntitiesForOrganization
+                Resource: '*'
+              # Organizations permissions
+              - Effect: Allow
+                Action:
+                  - organizations:ListAccounts
+                  - organizations:DescribeAccount
+                Resource: '*'
+              # S3 permissions for temporary file storage (internal bucket)
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:DeleteObject
+                Resource: !Sub 'arn:aws:s3:::${ReportsBucket}/*'
+              # Conditional S3 permissions for external bucket
+              - !If
+                - HasExternalS3Bucket
+                - Effect: Allow
+                  Action:
+                    - s3:PutObject
+                    - s3:GetObject
+                    - s3:ListBucket
+                  Resource: 
+                    - !Sub 'arn:aws:s3:::${S3BucketName}'
+                    - !Sub 'arn:aws:s3:::${S3BucketName}/*'
+                - !Ref AWS::NoValue
+
+  # Custom resource to generate a unique timestamp for S3 bucket name
+  TimestampGenerator:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt TimestampGeneratorFunction.Arn
+
+  # Lambda function to generate timestamp for S3 bucket name
+  TimestampGeneratorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      InlineCode: |
+        import cfnresponse
+        import datetime
+        import boto3
+        import os
+        
+        def handler(event, context):
+            if event['RequestType'] == 'Delete':
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                return
+            
+            try:
+                # Generate timestamp in format YYYYMMDD-HHMMSS
+                now = datetime.datetime.utcnow()
+                timestamp = now.strftime('%Y%m%d-%H%M%S')
+                
+                response_data = {
+                    'Timestamp': timestamp
+                }
+                
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+            except Exception as e:
+                cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+      Handler: index.handler
+      Runtime: python3.9
+      Timeout: 30
+
+  # S3 Bucket for temporary report storage with dynamic naming and 90-day lifecycle
+  ReportsBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: TimestampGenerator
+    Properties:
+      BucketName: !Sub 'health-events-${TimestampGenerator.Timestamp}-${AWS::StackName}'
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldReports
+            Status: Enabled
+            ExpirationInDays: 90
+      # Add server-side encryption
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  # Lambda function for health events analysis
+  HealthEventsAnalyzerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'aws-health-events-analyzer-${AWS::StackName}'
+      Handler: index.lambda_handler
+      Role: !GetAtt HealthEventsAnalyzerRole.Arn
+      Runtime: python3.9
+      CodeUri: ./src/
+      MemorySize: 2048
+      Timeout: 900  # 15 minutes in seconds
+      Layers:
+        - !Ref DependenciesLayer
+      Environment:
+        Variables:
+          ANALYSIS_WINDOW_DAYS: !Ref AnalysisWindowDays
+          SENDER_EMAIL: !Ref SenderEmail
+          RECIPIENT_EMAILS: !Ref RecipientEmails
+          EVENT_CATEGORIES: !Ref EventCategories
+          EXCEL_FILENAME_TEMPLATE: !Ref ExcelFilenameTemplate
+          REPORTS_BUCKET: !Ref ReportsBucket
+          EXCLUDED_SERVICES: !Ref ExcludedServices
+          CUSTOMER_NAME: !Ref CustomerName
+          # S3 environment variables with empty defaults
+          S3_BUCKET_NAME: !Ref S3BucketName
+          S3_KEY_PREFIX: !Ref S3KeyPrefix
+          # Bedrock configuration
+          BEDROCK_MODEL_ID: anthropic.claude-3-sonnet-20240229-v1:0
+          BEDROCK_MAX_TOKENS: 4000
+          BEDROCK_TEMPERATURE: 0.3
+          BEDROCK_TOP_P: !Ref BedrockTopP
+
+  # EventBridge Rule for scheduled execution - Run every Tuesday at 5 PM UTC
+  HealthEventsAnalyzerScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'health-events-analyzer-schedule-${AWS::StackName}'
+      Description: 'Schedule to trigger AWS Health Events Analyzer every Tuesday at 5 PM UTC'
+      ScheduleExpression: 'cron(0 17 ? * TUE *)'
+      State: !If [ScheduleIsEnabled, 'ENABLED', 'DISABLED']
+      Targets:
+        - Id: 'HealthEventsAnalyzerTarget'
+          Arn: !GetAtt HealthEventsAnalyzerFunction.Arn
+          Input: '{"source": "aws.events", "detail-type": "Scheduled Event", "resources": ["scheduled-trigger"]}'
+
+  # Permission for EventBridge to invoke Lambda
+  HealthEventsAnalyzerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref HealthEventsAnalyzerFunction
+      Principal: 'events.amazonaws.com'
+      SourceArn: !GetAtt HealthEventsAnalyzerScheduleRule.Arn
+
+Conditions:
+  ScheduleIsEnabled: !Equals [!Ref ScheduleEnabled, 'true']
+  HasExternalS3Bucket: !Not [!Equals [!Ref S3BucketName, '']]
+
+Outputs:
+  HealthEventsAnalyzerFunctionArn:
+    Description: 'ARN of the Lambda function'
+    Value: !GetAtt HealthEventsAnalyzerFunction.Arn
+  
+  HealthEventsAnalyzerRoleArn:
+    Description: 'ARN of the IAM role'
+    Value: !GetAtt HealthEventsAnalyzerRole.Arn
+    
+  ReportsBucketName:
+    Description: 'Name of the S3 bucket for report storage'
+    Value: !Ref ReportsBucket
+    
+  ExternalBucketName:
+    Description: 'Name of the external S3 bucket for health events analysis (if provided)'
+    Value: !If [HasExternalS3Bucket, !Ref S3BucketName, 'No external bucket specified']
+    
+  HealthEventsAnalyzerScheduleRuleArn:
+    Description: 'ARN of the EventBridge rule for scheduled execution'
+    Value: !GetAtt HealthEventsAnalyzerScheduleRule.Arn
+    
+  BucketTimestamp:
+    Description: 'Timestamp used in bucket name generation'
+    Value: !GetAtt TimestampGenerator.Timestamp
